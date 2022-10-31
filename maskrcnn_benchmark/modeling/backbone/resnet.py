@@ -86,6 +86,8 @@ ResNet152FPNStagesTo5 = tuple(
     for (i, c, r) in ((1, 3, True), (2, 8, True), (3, 36, True), (4, 3, True))
 )
 
+
+# ResNet 类
 class ResNet(nn.Module):
     def __init__(self, cfg):
         super(ResNet, self).__init__()
@@ -213,6 +215,7 @@ class ResNet(nn.Module):
         return outputs
 
 
+# ResNetHead 类
 class ResNetHead(nn.Module):
     def __init__(
         self,
@@ -281,6 +284,7 @@ class ResNetHead(nn.Module):
         return x
 
 
+# 使用_make_stage() 函数来创建对应的 stage
 def _make_stage(
     transformation_module,
     in_channels,
@@ -313,12 +317,28 @@ def _make_stage(
     return nn.Sequential(*blocks)
 
 
+# StemWithFixedBatchNorm 类负责构建 ResNet 的 stem 模块,
+# 也可以认为是 ResNet 的第一阶段(或者说是第零阶段),
+# 在 ResNet 50 中, 该阶段主要包含一个 7×7 大小的卷积核,
+# 在 MaskrcnnBenchmark 的实现中, 为了可以方便的复用实现各个 stage 的代码,
+# 它将第二阶段最开始的 3×3 的 max pooling 层也放到了 stem 中的 forward 函数中实现(一般不带参数网络层的都放在 forward 中)
+
+# 创建完 stem(stage1) 以后, 接下来就是需要创建 resnet 的 stage2~5,
+# 根据 resnet 的特点我们可以知道,
+# resnet2~5 阶段的整体结构是非常相似的, 都是有最基础的 resnet bottleneck block 堆叠形成的,
+# 不同 stage 的 bottleneck block 的数量不同,
+# 对于 resnet50 来说, 每一个阶段的 bottleneck block 的数量分别为 3,4,6,3,
+# 并且各个相邻 stage 之间的通道数都是两倍的关系, 所以可以很容易的从一个 stage 的通道数推知另一个 stage 的通道数
+
+
+
+# Bottleneck类
 class Bottleneck(nn.Module):
     def __init__(
         self,
-        in_channels,
-        bottleneck_channels,
-        out_channels,
+        in_channels,  # bottleneck 的输入 channels
+        bottleneck_channels,  # bottleneck 压缩后的 channels
+        out_channels,  # 输出 channels
         num_groups,
         stride_in_1x1,
         stride,
@@ -328,7 +348,14 @@ class Bottleneck(nn.Module):
     ):
         super(Bottleneck, self).__init__()
 
+        # downsample: 当 bottleneck 的输入和输出的 channels 不相等时, 则需要采用一定的策略
+        # 在原文中, 有 A, B, C三种策略, 本文采用的是 B 策略(也是原文推荐的)
+        # 即只有在输入输出通道数不相等时才使用 projection shortcuts,
+        # 也就是利用参数矩阵映射使得输入输出的 channels 相等
+
         self.downsample = None
+
+        # 当输入输出通道数不同时, 额外添加一个 1×1 的卷积层使得输入通道数映射成输出通道数
         if in_channels != out_channels:
             down_stride = stride if dilation == 1 else 1
             self.downsample = nn.Sequential(
@@ -338,7 +365,7 @@ class Bottleneck(nn.Module):
                 ),
                 norm_func(out_channels),
             )
-            for modules in [self.downsample,]:
+            for modules in [self.downsample, ]:
                 for l in modules.modules():
                     if isinstance(l, Conv2d):
                         nn.init.kaiming_uniform_(l.weight, a=1)
@@ -349,8 +376,12 @@ class Bottleneck(nn.Module):
         # The original MSRA ResNet models have stride in the first 1x1 conv
         # The subsequent fb.torch.resnet and Caffe2 ResNe[X]t implementations have
         # stride in the 3x3 conv
+        # 在 resnet 原文中, 会在 conv3_1, conv4_1, conv5_1 处使用 stride=2 的卷积
+        # 而在 fb.torch.resnet 和 caffe2 的实现中, 是将之后的 3×3 的卷积层的 stride 置为2
+        # 下面中的 stride 虽然默认值为1, 但是在函数调用时, 如果stage为3~5, 则会显示置为2
         stride_1x1, stride_3x3 = (stride, 1) if stride_in_1x1 else (1, stride)
 
+        # 当获取到当前stage所需的参数后, 就创建相应的卷积层, 创建原则参见 resnet50 的定义
         self.conv1 = Conv2d(
             in_channels,
             bottleneck_channels,
@@ -358,12 +389,13 @@ class Bottleneck(nn.Module):
             stride=stride_1x1,
             bias=False,
         )
-        self.bn1 = norm_func(bottleneck_channels)
+        self.bn1 = norm_func(bottleneck_channels)  # 后接一个固定参数的 BN 层
         # TODO: specify init for the above
         with_dcn = dcn_config.get("stage_with_dcn", False)
         if with_dcn:
             deformable_groups = dcn_config.get("deformable_groups", 1)
             with_modulated_dcn = dcn_config.get("with_modulated_dcn", False)
+            # 创建 bottleneck 的第二层卷积层
             self.conv2 = DFConv2d(
                 bottleneck_channels,
                 bottleneck_channels,
@@ -388,8 +420,9 @@ class Bottleneck(nn.Module):
             )
             nn.init.kaiming_uniform_(self.conv2.weight, a=1)
 
-        self.bn2 = norm_func(bottleneck_channels)
+        self.bn2 = norm_func(bottleneck_channels)  # 后接一个 BN 层
 
+        # 创建 bottleneck 的最后一个卷积层, padding默认为1
         self.conv3 = Conv2d(
             bottleneck_channels, out_channels, kernel_size=1, bias=False
         )
@@ -399,26 +432,34 @@ class Bottleneck(nn.Module):
             nn.init.kaiming_uniform_(l.weight, a=1)
 
     def forward(self, x):
-        identity = x
+        # 执行一次forward, 相当于执行一次 bottleneck,
+        # 默认情况下, 具有三个卷积层, 一个恒等连接, 每个卷积层之后都带有 BN 和 relu 激活
+        # 注意, 最后一个激活函数要放在恒等连接之后
 
+        identity = x  # 恒等连接, 直接令残差等于x即可
+
+        # conv1, bn1
         out = self.conv1(x)
         out = self.bn1(out)
         out = F.relu_(out)
 
+        # conv2, bn2
         out = self.conv2(out)
         out = self.bn2(out)
         out = F.relu_(out)
 
+        # conv3, bn3
         out = self.conv3(out)
         out = self.bn3(out)
 
         if self.downsample is not None:
+            # 如果输入输出的通道数不同, 则需要通过映射使之相同.
             identity = self.downsample(x)
 
-        out += identity
-        out = F.relu_(out)
+        out += identity  # H = F + x
+        out = F.relu_(out)  # 最后进行激活
 
-        return out
+        return out  # 返回有残差项的卷积结果
 
 
 class BaseStem(nn.Module):
